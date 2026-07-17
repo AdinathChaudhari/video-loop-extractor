@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.mp4
+*.webm
+*.mkv
+*.mov
+*.m4a
+*.aac
+*.opus
+*.part
+*.log
+logs/
+.DS_Store
+video-loop-extractor-*/
