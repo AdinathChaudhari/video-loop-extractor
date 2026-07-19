@@ -53,14 +53,31 @@ python video_loop_extractor.py "https://youtu.be/LpC7_HQ4Jmg" -y --json -o ~/Mov
 `-y` accepts every default; `--json` prints a single machine-readable result object on stdout
 (everything else goes to stderr). This is the form to script or test against.
 
+### Playlists
+
+```bash
+python video_loop_extractor.py "https://www.youtube.com/playlist?list=PL..." -y -o ~/Movies/loops
+```
+
+Give it a playlist (or channel) URL and it extracts a loop from **every** video in turn, writing
+one auto-named file per video into the output directory. Pure playlist URLs expand automatically;
+a `watch?v=…&list=…` URL is treated as a single video unless you pass `--yes-playlist`. Use
+`--no-playlist` to force single-video mode, and `--max-videos N` to cap how many are processed.
+Shared prefs (codec, audio, loop count, save location) are asked once up front; per-video failures
+are reported and skipped rather than aborting the run. Under `--json`, a single aggregate object is
+printed with a `results` array (one payload per video).
+
 ---
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `url` (positional) | — | Video URL. Omitted + TTY → interactive prompt; omitted + non-TTY → exit 2. |
-| `-o, --output PATH` | `~/Movies` (else `~/Videos`, else `~`) | Output file or directory. |
+| `url` (positional) | — | Video **or playlist** URL. Omitted + TTY → interactive prompt; omitted + non-TTY → exit 2. |
+| `-o, --output PATH` | `~/Movies` (else `~/Videos`, else `~`) | Output file or directory. A playlist always writes into a directory. |
+| `--yes-playlist` | off | Expand a `watch?v=…&list=…` URL into its whole playlist. Pure playlist URLs expand by default. |
+| `--no-playlist` | off | Treat the URL as a single video even if it references a playlist. |
+| `--max-videos INT` | `0` (no cap) | Cap how many playlist videos to process. |
 | `--codec {hevc,h264}` | `hevc` | `hevc` → libx265 + `hvc1` tag, `.mov`. `h264` → libx264, `.mp4`. |
 | `--crf INT` | `18` | Encode quality (0–51, lower = better). |
 | `--preset STR` | `slow` | x264/x265 preset. |
@@ -75,6 +92,10 @@ python video_loop_extractor.py "https://youtu.be/LpC7_HQ4Jmg" -y --json -o ~/Mov
 | `--analysis-fps FLOAT` | `1.0` | Sampling rate for coarse detection. |
 | `--min-period FLOAT` | `2.0` | Lower bound of the lag search, seconds. |
 | `--max-period FLOAT` | `0` (duration/2) | Upper bound of the lag search, seconds. |
+| `--analysis-height INT` | `480` | Soft target for the analysis download: tallest format with height ≤ this, under the analysis budget. `0` = tallest under budget (no soft cap). |
+| `--analysis-max-height INT` | `1080` | Hard ceiling for the escalated fine-motion re-download pass (Pass E). `0` = budget-only. |
+| `--analysis-budget-mb FLOAT` | `300.0` | Byte budget for any single analysis download (pass-0 or escalated). |
+| `--no-escalate` | off | Disable the fine-motion escalation ladder; detection behaves as a single coarse pass, exactly as before this feature. |
 | `--format STR` | auto | Raw yt-dlp format selector override for the HQ download (expert escape hatch). |
 | `--cookies-from-browser STR` | none | Passed through to every yt-dlp call — for age-gated/members-only videos. |
 | `--work-dir PATH` | fresh temp dir | Use this workspace instead of an auto-created one. |
@@ -111,6 +132,30 @@ The progress UI walks through these stages, in order:
 | **LOW** | Marginal signal (e.g. a slow ambient loop like rain or fog) | Interactive runs ask to confirm before spending time on the HQ download; `-y` proceeds with a warning. Watch the output for a seam. |
 | **NONE** | No reliable repeating loop detected | The tool refuses and exits (code 5). If you know the true period, re-run with `--period SECONDS` or `--frames N`. |
 | **STATIC** | Video is (near-)static — any cut "loops" trivially | Exits (code 5); override with `--period`/`--frames` if you actually want a clip from it. |
+
+### Fine-motion detection
+
+Small, low-amplitude motion (a subtle sway, a faint flicker) can be smoothed away by a low-res
+analysis download and an 8-bit fingerprint grid before detection ever sees it. Two independent
+improvements target this:
+
+- **Size-budgeted analysis download.** Instead of always fetching the worst available format, the
+  analysis download now picks the tallest format under `--analysis-budget-mb` (default 300 MB),
+  soft-capped by `--analysis-height` (default 480p; `0` = tallest under budget). This still
+  downloads the *entire* video (the whole-timeline rule is unaffected) — the budget only decides
+  which resolution to fetch. A source with no size metadata at all falls back to the previous
+  worst-format behavior automatically.
+- **Escalation ladder.** The first detection pass is unchanged (same 32×18/8-bit grid, same
+  thresholds) — a video that already detects keeps an identical verdict at identical cost. Only
+  if that pass comes back STATIC or NONE does a ladder of finer re-analysis passes run: a finer
+  64×36/16-bit re-fingerprint of the same file, a signed motion-energy signal derived from it, and
+  (network only, last resort) a higher-resolution re-download up to `--analysis-max-height`
+  (default 1080p). An escalation result only wins if it's positive (HIGH/MEDIUM/LOW) — it can
+  never turn a STATIC into NONE or invent a false loop in non-periodic footage — and is capped at
+  MEDIUM. Pass `--no-escalate` to disable the ladder entirely.
+- The `--json` payload gains an additive `detection` block: `{"analysis_height", "signal",
+  "escalation"}` reporting the analysis resolution actually used and which pass (if any) resolved
+  the loop.
 
 ---
 
