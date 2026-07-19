@@ -32,6 +32,23 @@ python video_loop_extractor.py "https://youtu.be/LpC7_HQ4Jmg" -y --json -o ~/Mov
 - `--json` — single result object on stdout, everything else on stderr; use this for asserting
   `loop.frames`, `loop.period_s`, `loop.confidence`/`verdict`, `seam.seamless`, etc. in tests.
 
+## Playlists
+
+- A playlist/channel URL is expanded (via `enumerate_playlist`, `yt-dlp -J --flat-playlist`) and
+  every video is processed sequentially, each in its own `video-NNN/` workspace subdir. Pure
+  playlist URLs expand by default; `watch?v=…&list=…` stays single unless `--yes-playlist`;
+  `--no-playlist` forces single; `--max-videos N` caps the count. A cheap URL heuristic
+  (`_url_maybe_playlist`) short-circuits the extra yt-dlp metadata call for plain video URLs.
+- **Per-video pipeline is `_process_video(ctx, timings)` → `(code, payload)`** — it never raises
+  for a stage failure (returns an error payload so a playlist keeps going). `_run_single` and
+  `_run_playlist` own the Live lifecycle, emission, summaries, and cleanup.
+- **One (non-nested) Live *session per video*** in playlist mode: `ui.reset()` → `ui.start()` →
+  worker → `ui.stop()`. This respects the single-Live rule (never two active at once), it just
+  runs sequential sessions. Shared prefs (codec/audio/loops/output dir) are gathered once via
+  `_resolve_playlist_prefs`; per-video prompts are suppressed by `args.is_playlist_item`.
+- Under `--json`, playlists emit one aggregate object (`{status, playlist, results:[…]}`), not
+  one object per video.
+
 ## Conventions & gotchas
 
 - **One-encode rule.** The single `ffmpeg` encode in the ENCODE stage is the *only* generation

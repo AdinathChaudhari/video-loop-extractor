@@ -53,14 +53,31 @@ python video_loop_extractor.py "https://youtu.be/LpC7_HQ4Jmg" -y --json -o ~/Mov
 `-y` accepts every default; `--json` prints a single machine-readable result object on stdout
 (everything else goes to stderr). This is the form to script or test against.
 
+### Playlists
+
+```bash
+python video_loop_extractor.py "https://www.youtube.com/playlist?list=PL..." -y -o ~/Movies/loops
+```
+
+Give it a playlist (or channel) URL and it extracts a loop from **every** video in turn, writing
+one auto-named file per video into the output directory. Pure playlist URLs expand automatically;
+a `watch?v=…&list=…` URL is treated as a single video unless you pass `--yes-playlist`. Use
+`--no-playlist` to force single-video mode, and `--max-videos N` to cap how many are processed.
+Shared prefs (codec, audio, loop count, save location) are asked once up front; per-video failures
+are reported and skipped rather than aborting the run. Under `--json`, a single aggregate object is
+printed with a `results` array (one payload per video).
+
 ---
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `url` (positional) | — | Video URL. Omitted + TTY → interactive prompt; omitted + non-TTY → exit 2. |
-| `-o, --output PATH` | `~/Movies` (else `~/Videos`, else `~`) | Output file or directory. |
+| `url` (positional) | — | Video **or playlist** URL. Omitted + TTY → interactive prompt; omitted + non-TTY → exit 2. |
+| `-o, --output PATH` | `~/Movies` (else `~/Videos`, else `~`) | Output file or directory. A playlist always writes into a directory. |
+| `--yes-playlist` | off | Expand a `watch?v=…&list=…` URL into its whole playlist. Pure playlist URLs expand by default. |
+| `--no-playlist` | off | Treat the URL as a single video even if it references a playlist. |
+| `--max-videos INT` | `0` (no cap) | Cap how many playlist videos to process. |
 | `--codec {hevc,h264}` | `hevc` | `hevc` → libx265 + `hvc1` tag, `.mov`. `h264` → libx264, `.mp4`. |
 | `--crf INT` | `18` | Encode quality (0–51, lower = better). |
 | `--preset STR` | `slow` | x264/x265 preset. |

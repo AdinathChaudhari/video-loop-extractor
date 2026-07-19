@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import copy
 import dataclasses
 import enum
 import importlib.util
@@ -40,7 +41,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROG_NAME = "video-loop-extractor"
 
 # --------------------------------------------------------------------------
@@ -293,6 +294,7 @@ class Ctx:
     raw_argv: list = dataclasses.field(default_factory=list)
     remote_components_supported: bool = False
     keep_workdir_due_to_failure: bool = False
+    playlist_title: str = None
     _encode_retry_done: bool = False
 
 
@@ -657,6 +659,17 @@ class UI:
             except Exception:
                 pass
             self.live = None
+
+    def reset(self):
+        """Clear the stage board, header, and any leftover tasks so a fresh
+        per-video run (playlist mode) starts from a clean slate. The Live is
+        started/stopped once per video by the caller — never nested."""
+        for key in list(self.tasks.keys()):
+            self.finish_task(key)
+        with self.lock:
+            self.state = {s[0]: StageState.PENDING for s in STAGES}
+            self.detail = {s[0]: "" for s in STAGES}
+            self.header_info = {}
 
     @contextlib.contextmanager
     def _paused(self):
@@ -1040,7 +1053,7 @@ def _resolve_output_path(ctx):
     placeholder_name = _build_output_filename(ctx)
     placeholder_path = ctx.paths["out_explicit_file"] or (ctx.paths["out_dir"] / placeholder_name)
     if placeholder_path.exists():
-        if interactive:
+        if interactive and not getattr(args, "is_playlist_item", False):
             resp = ctx.ui.prompt(
                 f"{placeholder_path.name} already exists. Overwrite? [y/N] (anything else auto-renames): ",
                 default="n",
@@ -1146,6 +1159,74 @@ def _probe_local_file(ctx) -> dict:
     ctx.ui.set_header(ctx.info["title"], duration, ctx.info["width"], ctx.info["height"], fps)
     _resolve_output_path(ctx)
     return ctx.info
+
+
+def _entry_url(entry) -> "str | None":
+    """Build a usable URL from a flat-playlist entry."""
+    if not isinstance(entry, dict):
+        return None
+    url = entry.get("url") or entry.get("webpage_url")
+    if url and url.startswith(("http://", "https://")):
+        return url
+    # A flat entry with no full URL but an id is a YouTube video (that extractor
+    # emits bare ids); build the canonical watch URL.
+    vid = entry.get("id")
+    if vid:
+        return f"https://www.youtube.com/watch?v={vid}"
+    return url
+
+
+def _url_maybe_playlist(url) -> bool:
+    """Cheap heuristic: does this URL look like it could carry a playlist? Used
+    to avoid an extra yt-dlp round-trip for plain single-video URLs."""
+    u = (url or "").lower()
+    return any(k in u for k in ("list=", "/playlist", "/channel/", "/user/", "/@", "/sets/"))
+
+
+def enumerate_playlist(ctx) -> "list | None":
+    """Return a list of {url, title} entries if ctx.args.url resolves to a
+    playlist, else None (single video). --no-playlist forces single; a pure
+    playlist URL is expanded by default, a watch+list URL only with
+    --yes-playlist."""
+    args = ctx.args
+    if args.local_file or args.no_playlist:
+        return None
+    # Skip the extra metadata call entirely for URLs that can't be a playlist.
+    if not args.yes_playlist and not _url_maybe_playlist(args.url):
+        return None
+
+    argv = _ytdlp_base_argv(ctx) + ["-J", "--flat-playlist"]
+    if not args.yes_playlist:
+        # Keeps watch?v=...&list=... as a single video while still expanding
+        # pure playlist/channel URLs.
+        argv += ["--no-playlist"]
+    argv += ["--", args.url]
+    cp = run_cmd(ctx, argv, stage="probe", timeout=120)
+    try:
+        last_line = [l for l in cp.stdout.splitlines() if l.strip()][-1]
+        info = json.loads(last_line)
+    except Exception as e:
+        raise StageError("probe", f"Could not parse yt-dlp playlist metadata: {e}", code=4)
+
+    if info.get("_type") != "playlist" and "entries" not in info:
+        return None
+
+    entries = []
+    for raw in (info.get("entries") or []):
+        url = _entry_url(raw)
+        if not url:
+            continue
+        entries.append({"url": url, "title": (raw.get("title") if isinstance(raw, dict) else None)})
+    if not entries:
+        return None
+    ctx.playlist_title = info.get("title") or None
+    if args.max_videos:
+        if len(entries) > args.max_videos:
+            sys.stderr.write(
+                f"Playlist has {len(entries)} videos; capping to first {args.max_videos} (--max-videos).\n"
+            )
+        entries = entries[: args.max_videos]
+    return entries
 
 
 def probe(ctx) -> dict:
@@ -2338,8 +2419,17 @@ def build_argparser():
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("url", nargs="?", default=None, help="Video URL (any yt-dlp-supported site).")
-    p.add_argument("-o", "--output", default=None, metavar="PATH", help="Output file or directory.")
+    p.add_argument("url", nargs="?", default=None,
+                    help="Video or playlist URL (any yt-dlp-supported site).")
+    p.add_argument("-o", "--output", default=None, metavar="PATH",
+                    help="Output file or directory (a playlist always writes into a directory).")
+    p.add_argument("--yes-playlist", action="store_true",
+                    help="If the URL references a playlist (e.g. watch?v=...&list=...), process every "
+                         "video in it. Pure playlist URLs are expanded by default.")
+    p.add_argument("--no-playlist", action="store_true",
+                    help="Treat the URL as a single video even if it references a playlist.")
+    p.add_argument("--max-videos", type=int, default=0, metavar="N",
+                    help="Cap how many playlist videos to process; 0 = no cap (default).")
     p.add_argument("--codec", choices=["hevc", "h264"], default="hevc",
                     help="hevc -> libx265 .mov (default); h264 -> libx264 .mp4.")
     p.add_argument("--crf", type=int, default=18, help="Encode quality, 0-51 (default 18).")
@@ -2387,6 +2477,10 @@ def validate_args(parser, args):
         parser.error("--period and --frames are mutually exclusive")
     if args.quiet and args.verbose:
         parser.error("--quiet and --verbose are mutually exclusive")
+    if args.yes_playlist and args.no_playlist:
+        parser.error("--yes-playlist and --no-playlist are mutually exclusive")
+    if args.max_videos < 0:
+        parser.error("--max-videos must be >= 0")
     if args.max_period and args.min_period >= args.max_period:
         parser.error("--min-period must be < --max-period")
     if not (0.1 < args.analysis_fps <= 30):
@@ -2409,6 +2503,10 @@ def _resolve_start(ctx):
 def _resolve_interactive_answers(ctx):
     args = ctx.args
     if not _is_interactive(ctx):
+        return
+    # Playlist items inherit the codec/audio/loops/output prefs gathered once
+    # up front (see _resolve_playlist_prefs); don't re-prompt for every video.
+    if getattr(args, "is_playlist_item", False):
         return
 
     heights = sorted({f.get("height") for f in (ctx.info.get("formats") or []) if f.get("height")}, reverse=True)
@@ -2587,45 +2685,18 @@ def _signal_handler(signum, frame):
 # --------------------------------------------------------------------------
 
 
-def main(argv=None):
-    parser = build_argparser()
-    raw_argv = list(argv) if argv is not None else sys.argv[1:]
-    args = parser.parse_args(raw_argv)
-    validate_args(parser, args)
+def _process_video(ctx, timings):
+    """Run the full probe -> finalize pipeline for ctx.args.url on ctx and
+    return (exit_code, payload).
 
-    stdin_tty = sys.stdin.isatty()
-    if args.url is None and not args.local_file and not stdin_tty:
-        parser.error("the following arguments are required: url (or use --local-file)")
-
-    if args.work_dir:
-        workdir = Path(args.work_dir).expanduser()
-    else:
-        workdir = Path(tempfile.mkdtemp(prefix="video-loop-extractor-"))
-    workdir.mkdir(parents=True, exist_ok=True)
-    (workdir / "logs").mkdir(parents=True, exist_ok=True)
-
-    ui = UI(args)
-    ctx = Ctx(args=args, workdir=workdir, ytdlp=[], ui=ui, raw_argv=raw_argv)
-    _register_cleanup(ctx)
-
-    timings = {}
+    Pipeline errors are caught and turned into an error payload with a nonzero
+    code so a playlist run can continue to the next video — this never raises
+    for a stage failure. KeyboardInterrupt/SystemExit propagate to the top
+    level. The caller owns the Live lifecycle (ui.start/stop), result emission,
+    human summaries, and workspace cleanup."""
+    args = ctx.args
+    ui = ctx.ui
     try:
-        env = check_environment(args)
-        ctx.ffmpeg = env.ffmpeg
-        ctx.ffprobe = env.ffprobe
-        ctx.ytdlp = env.ytdlp
-        ctx.remote_components_supported = env.remote_components_supported
-
-        _mark_skipped_stages(ctx)
-        ui.start()
-
-        if args.url is None and not args.local_file:
-            while True:
-                resp = ui.prompt("Video URL: ")
-                if resp:
-                    args.url = resp.strip()
-                    break
-
         t0 = time.monotonic()
         ui.set_stage("probe", StageState.RUNNING)
         probe(ctx)
@@ -2670,12 +2741,8 @@ def main(argv=None):
         if args.detect_only:
             for k in ("hq", "align", "encode", "verify", "done"):
                 ui.set_stage(k, StageState.SKIPPED)
-            ui.stop()
             payload = _build_json_payload(ctx, timings, seam=None, output_path=None, status="ok")
-            _emit_result(ctx, payload)
-            _print_human_summary(ctx, payload)
-            _cleanup(ctx)
-            return 0
+            return 0, payload
 
         if args.local_file:
             ui.set_stage("hq", StageState.SKIPPED)
@@ -2718,7 +2785,6 @@ def main(argv=None):
         ui.set_stage("done", StageState.RUNNING)
         out_path = finalize(ctx, single)
         ui.set_stage("done", StageState.DONE)
-        ui.stop()
 
         payload = _build_json_payload(ctx, timings, seam=seam, output_path=out_path, status="ok",
                                        verdict=final_verdict)
@@ -2726,10 +2792,212 @@ def main(argv=None):
             payload.setdefault("warnings", []).append(
                 "Seam not verified as seamless; consider retrying with --frames N+-1 or --start."
             )
-        _emit_result(ctx, payload)
+        return 0, payload
+
+    except StageError as e:
+        try:
+            ui.set_stage(e.stage, StageState.FAILED, detail=e.message)
+        except Exception:
+            pass
+        payload = {"status": "error", "stage": e.stage, "code": e.code, "message": e.message}
+        if e.hint:
+            payload["hint"] = e.hint
+        if e.log_path:
+            payload["log_path"] = e.log_path
+        ctx.keep_workdir_due_to_failure = True
+        return e.code, payload
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:  # pragma: no cover - last-resort guard, never a silent crash
+        payload = {"status": "error", "stage": "unknown", "code": 6, "message": str(e)}
+        ctx.keep_workdir_due_to_failure = True
+        if args.verbose:
+            import traceback
+            sys.stderr.write(traceback.format_exc())
+        return 6, payload
+
+
+def _run_single(ctx):
+    """Single-video run: one Live session, emit + summarize + clean up."""
+    ui = ctx.ui
+    timings = {}
+    _mark_skipped_stages(ctx)
+    ui.start()
+    code, payload = _process_video(ctx, timings)
+    ui.stop()
+    is_error = payload.get("status") == "error"
+    _emit_result(ctx, payload, error=is_error)
+    if not is_error:
         _print_human_summary(ctx, payload)
-        _cleanup(ctx)
-        return 0
+    _cleanup(ctx)
+    return code
+
+
+def _resolve_playlist_prefs(ctx):
+    """Gather the video-independent prefs (codec, audio, loops, output dir) once
+    for a whole playlist so individual videos never re-prompt. Mutates ctx.args
+    and pins args.output to a directory (each video auto-names its own file).
+    The resolution cap (--max-height) is left to per-video defaults, since it is
+    the one pref that legitimately varies per video."""
+    args = ctx.args
+    interactive = _is_interactive(ctx)
+
+    if interactive:
+        if not _flag_explicit(ctx, "codec"):
+            resp = ctx.ui.prompt(
+                "Output codec for all videos? [1] HEVC .mov (default)  [2] H.264 .mp4: ",
+                default="1",
+            )
+            if resp and resp.strip() == "2":
+                args.codec = "h264"
+        if not _flag_explicit(ctx, "audio"):
+            args.audio = ctx.ui.confirm("Include audio in each output?", default=False)
+        if not _flag_explicit(ctx, "loops"):
+            resp = ctx.ui.prompt("Repetitions in each output file? [1]: ", default="1")
+            try:
+                args.loops = max(1, int(resp))
+            except (TypeError, ValueError):
+                args.loops = 1
+
+    if args.output:
+        out_path = Path(args.output).expanduser()
+        looks_like_dir = out_path.is_dir() or (out_path.suffix == "" and not out_path.exists())
+        out_dir = out_path if looks_like_dir else out_path.parent
+    elif interactive:
+        default_dir = _default_output_dir()
+        resp = ctx.ui.prompt(f"Save all loops to [{_display_home(default_dir)}]: ", default=str(default_dir))
+        out_dir = Path(resp).expanduser() if resp else default_dir
+    else:
+        out_dir = _default_output_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args.output = str(out_dir)
+
+
+def _run_playlist(root_ctx, entries):
+    """Process every video in a playlist sequentially. Each video gets its own
+    workspace subdir and its own (non-nested) Live session; shared prefs are
+    resolved once up front. Per-video failures are reported and skipped, not
+    fatal."""
+    global _CTX_FOR_SIGNAL
+    args = root_ctx.args
+    ui = root_ctx.ui
+    n = len(entries)
+
+    label = root_ctx.playlist_title or args.url
+    if not args.json:
+        sys.stderr.write(f"Playlist: {label}\n{n} video(s) to process.\n")
+
+    if _is_interactive(root_ctx) and n > 25:
+        if not ui.confirm(f"That's {n} videos. Process all of them?", default=True):
+            raise StageError("probe", "Aborted by user (large playlist).", code=5)
+
+    _resolve_playlist_prefs(root_ctx)
+
+    results = []
+    codes = []
+    for i, entry in enumerate(entries, 1):
+        item_args = copy.copy(args)
+        item_args.url = entry["url"]
+        item_args.is_playlist_item = True
+        item_workdir = root_ctx.workdir / f"video-{i:03d}"
+        item_workdir.mkdir(parents=True, exist_ok=True)
+        (item_workdir / "logs").mkdir(parents=True, exist_ok=True)
+        item_ctx = Ctx(
+            args=item_args, workdir=item_workdir, ytdlp=root_ctx.ytdlp, ui=ui,
+            ffmpeg=root_ctx.ffmpeg, ffprobe=root_ctx.ffprobe,
+            remote_components_supported=root_ctx.remote_components_supported,
+            raw_argv=root_ctx.raw_argv,
+        )
+        _CTX_FOR_SIGNAL = item_ctx  # Ctrl-C cleans the active video's workspace
+
+        title = entry.get("title") or entry["url"]
+        if not args.json:
+            sys.stderr.write(f"\n[{i}/{n}] {title}\n")
+
+        ui.reset()
+        _mark_skipped_stages(item_ctx)
+        ui.start()
+        code, payload = _process_video(item_ctx, {})
+        ui.stop()
+
+        payload["playlist_index"] = i
+        results.append(payload)
+        codes.append(code)
+
+        if not args.json:
+            if payload.get("status") == "error":
+                _emit_result(item_ctx, payload, error=True)
+            else:
+                _print_human_summary(item_ctx, payload)
+
+        if item_ctx.keep_workdir_due_to_failure and not args.keep_temp:
+            sys.stderr.write(f"Workspace kept for inspection: {item_workdir}\n")
+        elif not args.keep_temp:
+            shutil.rmtree(item_workdir, ignore_errors=True)
+
+    _CTX_FOR_SIGNAL = root_ctx  # final cleanup targets the parent tree
+
+    succeeded = sum(1 for c in codes if c == 0)
+    if args.json:
+        agg = {
+            "status": "ok" if succeeded == n else "partial",
+            "playlist": {
+                "url": args.url, "title": root_ctx.playlist_title,
+                "count": n, "succeeded": succeeded,
+            },
+            "results": results,
+        }
+        print(json.dumps(agg), file=sys.stdout)
+        sys.stdout.flush()
+    else:
+        sys.stderr.write(f"\nPlaylist done: {succeeded}/{n} succeeded.\n")
+
+    _cleanup(root_ctx)
+    nonzero = [c for c in codes if c != 0]
+    return nonzero[0] if nonzero else 0
+
+
+def main(argv=None):
+    parser = build_argparser()
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    validate_args(parser, args)
+    args.is_playlist_item = False
+
+    stdin_tty = sys.stdin.isatty()
+    if args.url is None and not args.local_file and not stdin_tty:
+        parser.error("the following arguments are required: url (or use --local-file)")
+
+    if args.work_dir:
+        workdir = Path(args.work_dir).expanduser()
+    else:
+        workdir = Path(tempfile.mkdtemp(prefix="video-loop-extractor-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    (workdir / "logs").mkdir(parents=True, exist_ok=True)
+
+    ui = UI(args)
+    ctx = Ctx(args=args, workdir=workdir, ytdlp=[], ui=ui, raw_argv=raw_argv)
+    _register_cleanup(ctx)
+
+    try:
+        env = check_environment(args)
+        ctx.ffmpeg = env.ffmpeg
+        ctx.ffprobe = env.ffprobe
+        ctx.ytdlp = env.ytdlp
+        ctx.remote_components_supported = env.remote_components_supported
+
+        # Resolve the URL before any Live starts (plain prompt; no Live to pause).
+        if args.url is None and not args.local_file:
+            while True:
+                resp = ui.prompt("Video or playlist URL: ")
+                if resp:
+                    args.url = resp.strip()
+                    break
+
+        entries = enumerate_playlist(ctx)
+        if entries is not None:
+            return _run_playlist(ctx, entries)
+        return _run_single(ctx)
 
     except StageError as e:
         try:
