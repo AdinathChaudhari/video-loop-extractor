@@ -255,6 +255,8 @@ class CoarseResult:
     few_periods: bool = False
     provisional_only: bool = False
     borderline: object = None
+    escalation: str = None      # None | "rescue" | "finer" | "motion" | "redownload"
+    signal: str = "intensity"   # "intensity" | "motion"
 
 
 @dataclasses.dataclass
@@ -1118,6 +1120,59 @@ def _estimate_lowres_size(formats, duration):
 
 
 # --------------------------------------------------------------------------
+# §5.1 size-budgeted analysis-format picker (fine-motion detection, Req A/B)
+# --------------------------------------------------------------------------
+
+
+def _format_est_size(fmt, duration):
+    """Estimated whole-file size in bytes for a single yt-dlp format dict, or None
+    if it cannot be estimated (no filesize/filesize_approx and no tbr+duration)."""
+    s = fmt.get("filesize") or fmt.get("filesize_approx")
+    if s:
+        return float(s)
+    tbr = fmt.get("tbr")
+    if tbr and duration:
+        return tbr * 1000 / 8 * duration      # kbit/s -> bytes
+    return None
+
+
+def select_analysis_format(formats, duration, budget_bytes,
+                            target_height=0, min_height=0, max_height=0):
+    """Tallest video-only format whose estimated whole-file size fits budget_bytes.
+    Unknown estimated size is treated as NOT budget-safe (skipped) -- this guarantees
+    the budget is honored even when yt-dlp's metadata is sparse. min_height is STRICT
+    (>) so an escalation re-download is forced to fetch something taller than what
+    pass-0 already got. Returns a format dict or None. Pure metadata -- no network."""
+    cands = [f for f in (formats or [])
+             if f.get("vcodec") not in (None, "none")
+             and f.get("ext") != "mhtml" and f.get("height")]
+    fitted = []
+    for f in cands:
+        est = _format_est_size(f, duration)
+        if est is None or est > budget_bytes:
+            continue
+        h = f["height"]
+        if min_height and h <= min_height:
+            continue
+        if target_height and h > target_height:
+            continue
+        if max_height and h > max_height:
+            continue
+        fitted.append(f)
+    if not fitted:
+        return None
+    fitted.sort(key=lambda f: (f["height"], f.get("fps") or 0, f.get("tbr") or 0),
+                reverse=True)
+    return fitted[0]
+
+
+def _analysis_selector_string(fmt):
+    if fmt and fmt.get("format_id"):
+        return f"{fmt['format_id']}/wv*[height>=100][ext!=mhtml]/wv*[ext!=mhtml]/w"
+    return "wv*[height>=100][ext!=mhtml]/wv*[ext!=mhtml]/w"   # exact current worst-format string
+
+
+# --------------------------------------------------------------------------
 # §3.2 probe
 # --------------------------------------------------------------------------
 
@@ -1313,20 +1368,44 @@ _PROGRESS_TEMPLATE = (
 )
 
 
-def download_lowres(ctx) -> Path:
+def download_lowres(ctx, target_height=None, min_height=0) -> Path:
+    """Download the analysis copy. Pass 0 (target_height=None) picks the tallest
+    format under --analysis-budget-mb that is also <= --analysis-height (soft cap);
+    an escalated Pass E re-download (target_height=<value>) instead honors
+    --analysis-max-height as a hard ceiling and requires height > min_height so it
+    is forced strictly taller than whatever pass-0 already downloaded. Unknown-size
+    formats are never selected, so a metadata-sparse source falls back to today's
+    worst-format selector exactly -- see select_analysis_format/_analysis_selector_string.
+
+    Pass E writes to a DISTINCT filename ("lowres_hi" rather than "lowres") instead of
+    re-using pass-0's output template. Re-using "lowres.%(ext)s" is unreliable: yt-dlp
+    skips re-downloading when a complete file of that name already exists (no
+    --force-overwrites is set anywhere), so a same-container re-encode target is a
+    silent no-op, and when the container ext differs the pass-0 and Pass E files
+    coexist under the same "lowres.*" glob where `sorted(...)[0]` can pick the stale,
+    alphabetically-first pass-0 file. A distinct prefix sidesteps both failure modes
+    with no ambiguity, no extra yt-dlp flags, and no risk to the pass-0 glob."""
     args = ctx.args
     formats = ctx.info.get("formats") or []
-    est = _estimate_lowres_size(formats, ctx.info["duration"])
-    if est and est > 500 * 1024 * 1024:
-        msg = f"worst available stream is ~{est / 1024 / 1024:.0f} MB; analysis will download it fully"
+    budget = args.analysis_budget_mb * 1024 * 1024
+    th = target_height if target_height is not None else args.analysis_height
+    max_h = args.analysis_max_height if target_height is not None else 0
+    fmt = select_analysis_format(formats, ctx.info["duration"], budget,
+                                  target_height=th, min_height=min_height, max_height=max_h)
+    selector = _analysis_selector_string(fmt)
+
+    est = _format_est_size(fmt, ctx.info["duration"]) if fmt else _estimate_lowres_size(formats, ctx.info["duration"])
+    if est and est > budget:
+        msg = (f"analysis stream is ~{est / 1024 / 1024:.0f} MB (over the "
+               f"{args.analysis_budget_mb:.0f} MB budget); it will download fully")
         if _is_interactive(ctx):
             if not ctx.ui.confirm(msg + ". Continue?", default=True):
                 raise StageError("lowres", "Aborted by user (oversized lowres stream).", code=2)
         else:
             sys.stderr.write(msg + "\n")
 
-    selector = "wv*[height>=100][ext!=mhtml]/wv*[ext!=mhtml]/w"
-    out_tmpl = str(ctx.workdir / "lowres.%(ext)s")
+    out_name = "lowres" if target_height is None else "lowres_hi"
+    out_tmpl = str(ctx.workdir / f"{out_name}.%(ext)s")
     argv = _ytdlp_base_argv(ctx) + [
         "-f", selector,
         "--no-part", "--newline",
@@ -1341,12 +1420,12 @@ def download_lowres(ctx) -> Path:
         try:
             run_cmd(ctx, argv, stage="lowres", progress_parser=parser)
         except StageError:
-            _delete_partials(ctx.workdir, "lowres")
+            _delete_partials(ctx.workdir, out_name)
             run_cmd(ctx, argv, stage="lowres", progress_parser=parser)
     finally:
         ctx.ui.finish_task(task_key)
 
-    matches = sorted(p for p in ctx.workdir.glob("lowres.*") if p.suffix != ".part")
+    matches = sorted(p for p in ctx.workdir.glob(f"{out_name}.*") if p.suffix != ".part")
     if not matches:
         raise StageError("lowres", "yt-dlp did not produce a lowres file.", code=4)
     lowres_path = matches[0]
@@ -1369,6 +1448,7 @@ def download_lowres(ctx) -> Path:
     ctx.info["lowres_fps"] = _parse_fraction(vstream.get("avg_frame_rate") or "30/1")
     ctx.info["lowres_width"] = int(vstream.get("width") or 0)
     ctx.info["lowres_height"] = int(vstream.get("height") or 0)
+    ctx.info["analysis_height"] = ctx.info["lowres_height"]
     return lowres_path
 
 
@@ -1378,16 +1458,23 @@ def download_lowres(ctx) -> Path:
 
 
 def extract_fingerprints(ctx, video_path, fps, size=(32, 18), *, expect_frames=None,
-                          stage="detect", task_label="Analyzing frames", t_limit=None):
+                          stage="detect", task_label="Analyzing frames", t_limit=None,
+                          pix_fmt="gray", scale_flags="fast_bilinear"):
+    """§3.4. size/pix_fmt/scale_flags default to today's exact 32x18/8-bit/fast_bilinear
+    grid -- every pre-existing call site passes size= by keyword and omits the new
+    params, so pass-0 fingerprints are byte-identical to before this feature. The
+    escalation ladder (detect_period) is the only caller that passes pix_fmt="gray16le",
+    scale_flags="area" for finer, sub-8-bit-LSB-preserving fine-motion fingerprints."""
     W, H = size
-    frame_bytes = W * H
-    vf = f"scale={W}:{H}:flags=fast_bilinear"
+    bpp = 2 if pix_fmt.startswith("gray16") else 1
+    frame_bytes = W * H * bpp
+    vf = f"scale={W}:{H}:flags={scale_flags}"
     if fps is not None:
         vf = f"fps={fps}," + vf
     argv = [ctx.ffmpeg, "-v", "error", "-i", str(video_path)]
     if t_limit:
         argv += ["-t", f"{t_limit}"]
-    argv += ["-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    argv += ["-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
 
     task_key = ctx.ui.start_task(f"{stage}_fp_{id(video_path)}_{fps}", task_label, total=expect_frames, kind="analysis")
     try:
@@ -1395,23 +1482,32 @@ def extract_fingerprints(ctx, video_path, fps, size=(32, 18), *, expect_frames=N
     finally:
         ctx.ui.finish_task(task_key)
 
-    arr = np.frombuffer(b"".join(frames), dtype=np.uint8).reshape(len(frames), frame_bytes).astype(np.float32)
+    dt = np.dtype("<u2") if bpp == 2 else np.uint8
+    arr = np.frombuffer(b"".join(frames), dtype=dt).reshape(len(frames), W * H).astype(np.float32)
     return arr
 
 
-def _extract_fingerprints_window(ctx, path, fps, size, start_s, length_s, stage="align"):
+def _extract_fingerprints_window(ctx, path, fps, size, start_s, length_s, stage="align",
+                                  pix_fmt="gray", scale_flags="fast_bilinear"):
+    """size/pix_fmt/scale_flags default to the historical 32x18-or-caller-supplied
+    /8-bit/fast_bilinear grid -- the pre-existing _fingerprint_align call site omits
+    pix_fmt/scale_flags and is byte-identical to before. refine_period's local-file
+    branch is the only caller that passes pix_fmt="gray16le", scale_flags="area" for
+    escalation-sourced coarse results (see _refine_precision)."""
     W, H = size
-    frame_bytes = W * H
-    vf = f"fps={fps},scale={W}:{H}:flags=fast_bilinear"
+    bpp = 2 if pix_fmt.startswith("gray16") else 1
+    frame_bytes = W * H * bpp
+    vf = f"fps={fps},scale={W}:{H}:flags={scale_flags}"
     argv = [
         ctx.ffmpeg, "-v", "error",
         "-ss", f"{max(0.0, start_s)}",
         "-i", str(path),
         "-t", f"{max(0.1, length_s)}",
-        "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1",
+        "-vf", vf, "-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1",
     ]
     frames = _run_rawvideo_pipe(ctx, argv, frame_bytes, stage)
-    arr = np.frombuffer(b"".join(frames), dtype=np.uint8).reshape(len(frames), frame_bytes).astype(np.float32)
+    dt = np.dtype("<u2") if bpp == 2 else np.uint8
+    arr = np.frombuffer(b"".join(frames), dtype=dt).reshape(len(frames), W * H).astype(np.float32)
     return arr
 
 
@@ -1430,6 +1526,20 @@ def normalize_fingerprints(F):
     Fhat = centered / safe
     Fhat[zero_variance] = 0.0
     return Fhat, zero_variance
+
+
+def temporal_difference_fingerprints(F):
+    """Fine-motion escalation signal (Req C): signed frame-to-frame motion field
+    D[t] = F[t] - F[t-1], D[0] = 0. Signed (not abs) so opposite motions (e.g. a
+    pendulum swinging left vs right) stay distinguishable rather than collapsing to
+    the same magnitude. Feed the result through normalize_fingerprints() same as any
+    other fingerprint array -- a near-static scene's tiny motion is amplified to a
+    unit vector capturing *where* motion happened; a truly static scene's D is just
+    temporally-independent camera/codec noise, so its autocorrelation is ~0 and no
+    peaks emerge (never a false loop)."""
+    D = np.zeros_like(F)
+    D[1:] = F[1:] - F[:-1]
+    return D
 
 
 def _sim_rows(Fhat, idx_a, idx_b):
@@ -1483,18 +1593,21 @@ def _local_maxima_mask(R):
     return mask
 
 
-def find_peaks(Ls, R, Z, C):
-    """§4.5: strong peaks (Z>=4, C>=0.5) and provisional peaks (Z>=4, 0.35<=C<0.5),
-    both local-max filtered and merged within tolerance keeping the highest Z."""
+def find_peaks(Ls, R, Z, C, z_strong=4.0, c_strong=0.5, z_prov=4.0, c_prov=0.35):
+    """§4.5: strong peaks (Z>=z_strong, C>=c_strong) and provisional peaks
+    (Z>=z_prov, c_prov<=C<c_strong), both local-max filtered and merged within
+    tolerance keeping the highest Z. Defaults reproduce the original fixed
+    thresholds exactly; the fine-motion escalation ladder relaxes them for
+    low-contrast content."""
     mask = _local_maxima_mask(R)
     strong, provisional = [], []
     for i in range(len(Ls)):
         if not mask[i]:
             continue
         Li, Zi, Ci = int(Ls[i]), float(Z[i]), float(C[i])
-        if Zi >= 4.0 and Ci >= 0.5:
+        if Zi >= z_strong and Ci >= c_strong:
             strong.append((Li, Zi, Ci))
-        elif Zi >= 4.0 and 0.35 <= Ci < 0.5:
+        elif Zi >= z_prov and c_prov <= Ci < c_strong:
             provisional.append((Li, Zi, Ci))
 
     def _merge(cands):
@@ -1624,7 +1737,17 @@ def _loop_start(Fhat, L0, b, RL0, analysis_fps):
 # --------------------------------------------------------------------------
 
 
-def _detect_pass(ctx, F, analysis_fps, min_period, max_period_arg, pass_label="coarse"):
+def _detect_pass(ctx, F, analysis_fps, min_period, max_period_arg, pass_label="coarse", *,
+                  z_strong=4.0, c_strong=0.5, z_prov=4.0, c_prov=0.35,
+                  static_floor=0.005, static_zero_frac=0.30,
+                  disable_static=False, strict_fundamental=False):
+    """§3.5 core detection pass. Keyword-only params default to today's exact fixed
+    thresholds -- callers that omit them (the original pass-0 call site) are
+    byte-identical to before this feature. The fine-motion escalation ladder in
+    detect_period() passes a relaxed low-contrast preset on the finer/motion/redownload
+    passes, plus disable_static=True for motion-energy signals (a static scene's
+    motion field must fail via missing peaks -> NONE, never a spurious STATIC) and
+    strict_fundamental=True as a false-positive guard (see below)."""
     Fhat, zero_var = normalize_fingerprints(F)
     T = Fhat.shape[0]
     duration = T / analysis_fps
@@ -1641,11 +1764,11 @@ def _detect_pass(ctx, F, analysis_fps, min_period, max_period_arg, pass_label="c
     b, s, Z, C = baseline_contrast(R)
 
     zero_frac = float(np.mean(zero_var)) if len(zero_var) else 0.0
-    if (1 - b) < 0.005 or zero_frac > 0.30:
+    if not disable_static and ((1 - b) < static_floor or zero_frac > static_zero_frac):
         return CoarseResult(period_lag=None, period_s=0.0, confidence=0.0, verdict="STATIC",
                              candidates=[], loop_start_s=0.0, curve=R)
 
-    strong, provisional, mask = find_peaks(Ls, R, Z, C)
+    strong, provisional, mask = find_peaks(Ls, R, Z, C, z_strong, c_strong, z_prov, c_prov)
     all_peak_lags = _all_peak_lags(Ls, Z, mask)
 
     provisional_only = False
@@ -1667,8 +1790,16 @@ def _detect_pass(ctx, F, analysis_fps, min_period, max_period_arg, pass_label="c
         scored.append({"L": L, "Z": Zc, "C": Cc, "supp": supp, "few_periods": few})
     scored.sort(key=lambda d: d["L"])
 
-    fund_candidates = [d for d in scored if d["supp"] >= 0.6 and d["Z"] >= 4.0]
+    fund_candidates = [d for d in scored if d["supp"] >= 0.6 and d["Z"] >= z_strong]
     if not fund_candidates:
+        if strict_fundamental:
+            # False-positive guard for the escalation ladder's relaxed Z/C: on
+            # non-periodic footage the relaxed thresholds could surface a spurious
+            # peak, but a real loop has harmonic-comb support (supp>=0.6). Refuse to
+            # invent a fundamental rather than fall back to raw `scored` -- keeps
+            # non-periodic footage at NONE (Req D).
+            return CoarseResult(period_lag=None, period_s=0.0, confidence=0.0,
+                                 verdict="NONE", candidates=[], loop_start_s=0.0, curve=R)
         fund_candidates = scored
     chosen = min(fund_candidates, key=lambda d: d["L"])
     few_periods = chosen["few_periods"]
@@ -1754,57 +1885,184 @@ def _detect_pass(ctx, F, analysis_fps, min_period, max_period_arg, pass_label="c
     return result
 
 
+POSITIVE = ("HIGH", "MEDIUM", "LOW")
+
+# Thresholds for the escalation ladder's finer/motion/redownload passes.
+# Fine-motion signals are analyzed from very few effective samples (a 72s clip at
+# --analysis-fps 1 is only T=72 rows, half of which can be exact-zero motion-energy
+# rows when the source's discrete transitions don't land on the sampling grid --
+# see CLAUDE.md fine-motion notes), which drives genuine periodic peaks' Z-scores
+# down into the 2.5-3.0 band even though their C (contrast-vs-baseline) is already
+# well past the *original* c_strong of 0.25. z_strong/z_prov=3.0 (pass-0's fixed
+# thresholds) clip exactly those peaks. Lowered here to 2.5/2.2 with c_strong/c_prov
+# proportionally relaxed. This is only ever reachable after a non-positive pass-0 AND
+# guarded by strict_fundamental=True (refuses to promote a lag to "the" period
+# without harmonic-comb support at >=60% of its multiples), so a relaxed Z bar cannot
+# manufacture a period out of non-periodic footage -- see the fixture regression
+# sweep (static.mp4/non_periodic.mp4 stay NONE/STATIC across --analysis-fps 1-15).
+_LOW_CONTRAST_PRESET = dict(z_strong=2.5, c_strong=0.20, z_prov=2.2, c_prov=0.10,
+                             static_floor=0.0008, strict_fundamental=True)
+
+
+def _cap_medium(r):
+    """Escalation verdicts are capped at MEDIUM: fine-motion loops recovered only
+    via relaxed low-contrast thresholds / motion-energy are legitimately
+    lower-confidence than a pass-0 HIGH (same reasoning as the ambient ground-truth
+    MEDIUM -- see CLAUDE.md)."""
+    if r.verdict == "HIGH":
+        r.verdict = "MEDIUM"
+        r.confidence = min(r.confidence, 0.79)
+    return r
+
+
+def _can_escalate_resolution(ctx):
+    """Is there a format strictly taller than what pass-0 already downloaded, still
+    inside the analysis budget and under --analysis-max-height? Metadata-only check
+    (no network) so Pass E can be skipped cheaply when nothing taller fits."""
+    budget = ctx.args.analysis_budget_mb * 1024 * 1024
+    return select_analysis_format(
+        ctx.info.get("formats"), ctx.info["duration"], budget,
+        target_height=ctx.args.analysis_max_height,
+        min_height=ctx.info.get("analysis_height", 0)) is not None
+
+
+def _finalize_nonpositive(ctx, base):
+    """Centralized STATIC/NONE exit: under --detect-only return the result as-is;
+    otherwise raise the corresponding fatal StageError (exit 5). Shared by the
+    original pass-0 path and the end of the escalation ladder so both raise the
+    identical messages as before this feature."""
+    if base.verdict == "STATIC":
+        if ctx.args.detect_only:
+            return base
+        raise StageError("detect", "Video is (nearly) static -- any cut loops trivially; "
+                                    "no meaningful period exists.", code=5)
+    # base.verdict == "NONE"
+    if ctx.args.detect_only:
+        return base
+    raise StageError(
+        "detect",
+        f"No reliable repeating loop detected (best candidate {base.period_s:.2f}s, "
+        f"confidence {base.confidence:.2f}). If you know the period, re-run with --period SECONDS.",
+        code=5,
+    )
+
+
+def _try_subsecond_rescue(ctx, base):
+    """Sub-second loop rescue (short-period loops), refactored from the original
+    detect_period body to RETURN a positive CoarseResult or None instead of raising --
+    a rescue miss now falls through to the finer/motion/redownload passes rather than
+    being fatal. Runs only under the original gate: base is NONE with a period_lag at
+    or below the min-period boundary, or a curve that's monotonically pinned (both
+    signs of a period shorter than the search floor)."""
+    args = ctx.args
+    analysis_fps = args.analysis_fps
+    if base.verdict != "NONE" or base.period_lag is None:
+        return None
+    L_min = max(2, math.ceil(args.min_period * analysis_fps))
+    if not (base.period_lag <= L_min + 1 or (base.curve is not None and _is_pinned(base.curve))):
+        return None
+
+    rescue_fps = analysis_fps * 4
+    window_s = min(ctx.info["duration"], 600)
+    n_frames = int(window_s * rescue_fps)
+    F2 = extract_fingerprints(
+        ctx, ctx.paths["lowres"], fps=rescue_fps, size=(32, 18),
+        expect_frames=n_frames, stage="detect",
+        task_label="Re-analyzing (sub-second loop rescue)", t_limit=window_s,
+    )
+    result2 = _detect_pass(ctx, F2, rescue_fps, args.min_period, args.max_period, pass_label="rescue")
+    if result2.verdict == "STATIC":
+        result2.verdict = "NONE"
+    if result2.verdict != "NONE":
+        return result2
+    return None
+
+
 def detect_period(ctx, F) -> CoarseResult:
-    """§3.5. Verdict NONE/STATIC raises StageError (exit 5) unless --detect-only."""
+    """§3.5. Verdict NONE/STATIC raises StageError (exit 5) unless --detect-only.
+
+    Pass 0 is byte-identical to the original single-pass implementation -- every
+    currently-detecting video returns an identical verdict, at identical cost,
+    because a positive pass-0 verdict returns immediately (no escalation touched).
+    Only a non-positive pass-0 (STATIC or NONE) runs the fine-motion escalation
+    ladder (Req C): sub-second rescue -> finer grid/16-bit re-fingerprint (same
+    file) -> signed motion-energy (same array, pure numpy) -> higher-res re-download
+    (network only, last resort). The win-rule is load-bearing for Req D: an
+    escalation result only replaces `base` if its verdict is POSITIVE; if every
+    escalation pass stays non-positive, the ORIGINAL pass-0 result is returned
+    unchanged -- escalation can only add detections, never convert a STATIC to NONE
+    or a NONE to a spurious loop."""
     args = ctx.args
     analysis_fps = args.analysis_fps
 
-    result = _detect_pass(ctx, F, analysis_fps, args.min_period, args.max_period, pass_label="coarse")
+    base = _detect_pass(ctx, F, analysis_fps, args.min_period, args.max_period, pass_label="coarse")
+    if base.verdict in POSITIVE:
+        return base                                  # pass 0 unchanged -- no escalation, no cost
+    if args.no_escalate:
+        return _finalize_nonpositive(ctx, base)
 
-    if result.verdict == "STATIC":
-        if args.detect_only:
-            return result
-        raise StageError("detect", "Video is (nearly) static -- any cut loops trivially; "
-                                    "no meaningful period exists.", code=5)
+    # Pass B: existing sub-second rescue (short-period loops), 32x18 / 4x fps.
+    r = _try_subsecond_rescue(ctx, base)
+    if r is not None:
+        r.escalation = "rescue"
+        return r
 
-    if result.verdict == "NONE" and result.period_lag is not None:
-        L_min = max(2, math.ceil(args.min_period * analysis_fps))
-        if result.period_lag <= L_min + 1 or (result.curve is not None and _is_pinned(result.curve)):
-            rescue_fps = analysis_fps * 4
-            window_s = min(ctx.info["duration"], 600)
-            n_frames = int(window_s * rescue_fps)
-            F2 = extract_fingerprints(
-                ctx, ctx.paths["lowres"], fps=rescue_fps, size=(32, 18),
-                expect_frames=n_frames, stage="detect",
-                task_label="Re-analyzing (sub-second loop rescue)", t_limit=window_s,
-            )
-            result2 = _detect_pass(ctx, F2, rescue_fps, args.min_period, args.max_period, pass_label="rescue")
-            if result2.verdict == "STATIC":
-                result2.verdict = "NONE"
-            if result2.verdict != "NONE":
-                return result2
-            if args.detect_only:
-                return result2
-            raise StageError(
-                "detect",
-                "No reliable repeating loop detected; loop may be < 0.5s -- try --analysis-fps 10.",
-                code=5,
-            )
+    dur = ctx.info["duration"]
+    ef = int((dur or 0) * analysis_fps) or None
 
-    # Final guard: any NONE that reached here (no peaks at a mid-range lag, or a
-    # low-confidence winner) is fatal unless --detect-only. This is the single
-    # authoritative NONE exit -- without it the pipeline would silently encode a
-    # bogus loop and exit 0 on non-periodic footage whose best lag is mid-range.
-    if result.verdict == "NONE":
-        if args.detect_only:
-            return result
-        raise StageError(
-            "detect",
-            f"No reliable repeating loop detected (best candidate {result.period_s:.2f}s, "
-            f"confidence {result.confidence:.2f}). If you know the period, re-run with --period SECONDS.",
-            code=5,
-        )
-    return result
+    # Pass C: finer grid + 16-bit intensity, SAME file, re-fingerprint only (no download).
+    F2 = extract_fingerprints(ctx, ctx.paths["lowres"], fps=analysis_fps, size=(64, 36),
+                              pix_fmt="gray16le", scale_flags="area", expect_frames=ef,
+                              stage="detect", task_label="Re-analyzing (fine motion 64x36/16-bit)")
+    finer = _detect_pass(ctx, F2, analysis_fps, args.min_period, args.max_period, pass_label="finer",
+                         **_LOW_CONTRAST_PRESET)
+    if finer.verdict in POSITIVE:
+        finer.escalation = "finer"
+        return _cap_medium(finer)
+
+    # Pass D: motion-energy on the SAME F2, numpy only (no ffmpeg, no download).
+    motion = _detect_pass(ctx, temporal_difference_fingerprints(F2), analysis_fps,
+                          args.min_period, args.max_period, pass_label="motion",
+                          disable_static=True, **_LOW_CONTRAST_PRESET)
+    if motion.verdict in POSITIVE:
+        motion.escalation = "motion"
+        motion.signal = "motion"
+        return _cap_medium(motion)
+
+    # Pass E: higher-res re-download (network only; skipped for --local-file). Last resort.
+    # Wrapped: this is still just an escalation attempt, so a download/probe/fingerprint
+    # failure here must fall through to the pass-0 `base` verdict exactly like a
+    # non-positive Pass E result does, never propagate as a fatal StageError -- otherwise
+    # a genuinely STATIC/NONE network video would exit 4 (or blow up --detect-only, whose
+    # contract is a cheap, non-fatal sanity check) purely because the LAST-RESORT
+    # re-download hiccuped, which breaks the win-rule/Req-D invariant that escalation can
+    # only ever ADD a detection, never turn a correct negative into an error.
+    if not args.local_file and _can_escalate_resolution(ctx):
+        try:
+            download_lowres(ctx, target_height=args.analysis_max_height,
+                            min_height=ctx.info.get("analysis_height", 0))
+            ef2 = int((ctx.info["duration"] or 0) * analysis_fps) or None
+            F3 = extract_fingerprints(ctx, ctx.paths["lowres"], fps=analysis_fps, size=(64, 36),
+                                      pix_fmt="gray16le", scale_flags="area", expect_frames=ef2,
+                                      stage="detect", task_label="Re-analyzing (higher-res copy)")
+            f3 = _detect_pass(ctx, F3, analysis_fps, args.min_period, args.max_period, pass_label="finer2",
+                              **_LOW_CONTRAST_PRESET)
+            if f3.verdict in POSITIVE:
+                f3.escalation = "redownload"
+                return _cap_medium(f3)
+            m3 = _detect_pass(ctx, temporal_difference_fingerprints(F3), analysis_fps,
+                              args.min_period, args.max_period, pass_label="motion2",
+                              disable_static=True, **_LOW_CONTRAST_PRESET)
+            if m3.verdict in POSITIVE:
+                m3.escalation = "redownload"
+                m3.signal = "motion"
+                return _cap_medium(m3)
+        except StageError as e:
+            ctx.ui.note_detail("detect", f"Pass E re-download skipped ({e}); using pass-0 result")
+
+    # Nothing positive from any escalation pass -> pass-0 verdict is authoritative
+    # (STATIC stays STATIC, NONE stays NONE) -- this is the Req D regression guard.
+    return _finalize_nonpositive(ctx, base)
 
 
 # --------------------------------------------------------------------------
@@ -1889,6 +2147,38 @@ def _download_refine_sample(ctx, start, length, fps_hq):
     return matches[0]
 
 
+def _refine_precision(coarse):
+    """Escalation-sourced coarse verdicts (fine-motion recoveries, see detect_period)
+    are only found because the escalation ladder re-fingerprints at 64x36/16-bit/area
+    instead of pass-0's 32x18/8-bit/fast_bilinear. If refine_period then re-derives
+    its own fingerprints at the historical 48x27/8-bit/fast_bilinear grid, the exact
+    same sub-8-bit-LSB quantization loss that forced escalation in the first place
+    reappears here: the offset-search alignment score S_best collapses (observed
+    ~0.77 on the fine-motion fixture, verified with 64x36/16-bit/area) and falls
+    below the S_best<0.985 fidelity gate below, silently downgrading a correctly
+    recovered LOW/MEDIUM verdict by a notch (or straight to NONE) -- see CLAUDE.md
+    fine-motion notes. Matching refine's precision to whatever precision actually
+    found the period (verified ~0.99999 S_best on the same fixture) fixes this at
+    the root instead of relaxing the fidelity gate itself. Ordinary (escalation=None)
+    coarse results -- the overwhelming common case -- keep the exact historical
+    48x27/8-bit/gray/fast_bilinear refine fingerprint: byte-identical, zero
+    regression risk for loops that already detect fine at pass-0.
+
+    The pre-existing sub-second rescue path (escalation="rescue", see
+    _try_subsecond_rescue) is NOT one of the finer-grid escalations: it finds its
+    period at the historical 32x18/8-bit/fast_bilinear grid (same precision as
+    pass-0, just 4x the fps), so matching refine's precision to "whatever precision
+    actually found the period" means keeping the 48x27/8-bit grid for it too --
+    switching it to 64x36/16-bit/area would refine at a DIFFERENT precision than
+    the one that found the loop, risking a +/-1 frame shift in j_best or a spurious
+    S_best-gate flip on a pre-existing, offline-untested detection path. Only the
+    escalation values that actually re-fingerprinted at 64x36/16-bit/area -- "finer",
+    "motion", "redownload" -- get the finer refine grid."""
+    if coarse.escalation in ("finer", "motion", "redownload"):
+        return dict(size=(64, 36), pix_fmt="gray16le", scale_flags="area")
+    return dict(size=(48, 27), pix_fmt="gray", scale_flags="fast_bilinear")
+
+
 def refine_period(ctx) -> LoopResult:
     args = ctx.args
     coarse = ctx.coarse
@@ -1911,6 +2201,7 @@ def refine_period(ctx) -> LoopResult:
         return LoopResult(frames=int(N), fps=fps_hq, period_s=N / fps_hq, start_s=coarse.loop_start_s,
                            confidence=coarse.confidence, verdict=coarse.verdict)
 
+    prec = _refine_precision(coarse)
     if args.local_file:
         # No separate "refine download" for a local file -- it already contains the
         # exact HQ-fps source; fingerprint a local relative-time window of it directly.
@@ -1919,15 +2210,18 @@ def refine_period(ctx) -> LoopResult:
         fps_used = info["fps"] or fps_hq
         ctx.info["is_vfr"] = bool(info["is_vfr"] or ctx.info.get("is_vfr", False))
         got_hq_fps = True
-        F = _extract_fingerprints_window(ctx, refine_path, fps_used, (48, 27), start, length, stage="refine")
+        F = _extract_fingerprints_window(ctx, refine_path, fps_used, prec["size"], start, length,
+                                          stage="refine", pix_fmt=prec["pix_fmt"],
+                                          scale_flags=prec["scale_flags"])
     else:
         refine_path = _download_refine_sample(ctx, start, length, fps_hq)
         info = _ffprobe_stream_info(ctx, refine_path)
         fps_used = info["fps"] or fps_hq
         ctx.info["is_vfr"] = bool(info["is_vfr"] or ctx.info.get("is_vfr", False))
         got_hq_fps = info["got_hq_fps"]
-        F = extract_fingerprints(ctx, refine_path, fps=None, size=(48, 27), stage="refine",
-                                  task_label="Frame-exact refinement")
+        F = extract_fingerprints(ctx, refine_path, fps=None, size=prec["size"], stage="refine",
+                                  task_label="Frame-exact refinement", pix_fmt=prec["pix_fmt"],
+                                  scale_flags=prec["scale_flags"])
     Fhat, _ = normalize_fingerprints(F)
 
     def _score_window(period_guess_s):
@@ -2451,6 +2745,18 @@ def build_argparser():
     p.add_argument("--min-period", type=float, default=2.0, help="Lag search minimum, seconds (default 2.0).")
     p.add_argument("--max-period", type=float, default=0.0,
                     help="Lag search maximum, seconds (default 0 = duration/2).")
+    p.add_argument("--analysis-height", type=int, default=480, metavar="N",
+                    help="Soft target for the analysis download: tallest format with "
+                         "height<=N under the analysis budget (default 480; 0 = tallest "
+                         "under budget, no soft cap).")
+    p.add_argument("--analysis-max-height", type=int, default=1080, metavar="N",
+                    help="Hard ceiling for the escalated fine-motion re-download pass "
+                         "(default 1080; 0 = budget-only).")
+    p.add_argument("--analysis-budget-mb", type=float, default=300.0, metavar="MB",
+                    help="Byte budget for any single analysis download (default 300.0).")
+    p.add_argument("--no-escalate", action="store_true",
+                    help="Disable the fine-motion escalation ladder; detect_period behaves "
+                         "exactly as a single coarse pass.")
     p.add_argument("--format", default=None, metavar="SELECTOR",
                     help="Raw yt-dlp format selector override for the HQ download.")
     p.add_argument("--cookies-from-browser", default=None, metavar="BROWSER",
@@ -2485,6 +2791,12 @@ def validate_args(parser, args):
         parser.error("--min-period must be < --max-period")
     if not (0.1 < args.analysis_fps <= 30):
         parser.error("--analysis-fps must be in (0.1, 30]")
+    if args.analysis_budget_mb <= 0:
+        parser.error("--analysis-budget-mb must be > 0")
+    if args.analysis_height < 0:
+        parser.error("--analysis-height must be >= 0")
+    if args.analysis_max_height < 0:
+        parser.error("--analysis-max-height must be >= 0")
     if args.frames is not None:
         args.no_refine = True
 
@@ -2577,6 +2889,12 @@ def _build_json_payload(ctx, timings, seam=None, output_path=None, status="ok", 
             "wrap_similarity": seam.wrap_similarity, "adjacent_p5": seam.adjacent_p5,
             "z": seam.z, "seamless": seam.seamless,
         }
+    if ctx.coarse is not None:
+        payload["detection"] = {
+            "analysis_height": ctx.info.get("analysis_height") if ctx.info else None,
+            "signal": ctx.coarse.signal,
+            "escalation": ctx.coarse.escalation,
+        }
     if output_path is not None:
         try:
             size_bytes = output_path.stat().st_size
@@ -2641,7 +2959,8 @@ def _cleanup(ctx):
         sys.stderr.write(f"Workspace kept for inspection: {ctx.workdir}\n")
         return
     if ctx.args.work_dir:
-        for pattern in ("lowres.*", "refine.*", "raw.*", "rawaudio.*", "loop_single.*", "loop_final.*"):
+        for pattern in ("lowres.*", "lowres_hi.*", "refine.*", "raw.*", "rawaudio.*",
+                        "loop_single.*", "loop_final.*"):
             for f in ctx.workdir.glob(pattern):
                 try:
                     f.unlink()

@@ -88,8 +88,72 @@ python video_loop_extractor.py "https://youtu.be/LpC7_HQ4Jmg" -y --json -o ~/Mov
   before cleanup.
 - **Reference ground truth:** `https://youtu.be/LpC7_HQ4Jmg` — the proven end-to-end case, a
   3h47m 4K/60fps video whose visual loop is *exactly* 720 frames = 12.000 s @ 60 fps. Use it for
-  the full network E2E test; assert `loop.frames == 720`, `loop.period_s == 12.0`, and
-  `seam.seamless == true`. Verdict is **MEDIUM** here, not HIGH: the scene is near-static so its
-  frame-to-frame contrast is low (confidence ~0.75), which is correct behavior — a low-contrast
-  ambient loop legitimately scores MEDIUM even when the extracted loop is perfect. Don't "fix"
-  detection to force HIGH on ambient scenes.
+  the full network E2E test; assert `loop.frames == 720` and `loop.period_s == 12.0` (frame count
+  is the load-bearing invariant — see frame-count-is-truth above) and `seam.seamless == true`.
+  **Verdict/analysis_height caveat (post size-budgeted analysis picker):** historically this
+  scored MEDIUM at 144p (confidence ~0.75) because the near-static scene's low frame-to-frame
+  contrast was further smoothed by 144p quantization. Since the size-budgeted analysis picker
+  (`--analysis-height`/`--analysis-budget-mb`, see fine-motion detection below) can select a
+  taller format when one fits the byte budget, `detection.analysis_height` and the verdict for
+  this specific video are a function of *this video's current yt-dlp format list* (filesizes,
+  not just nominal resolution) at the time of the test run, not a fixed constant — re-verify both
+  numbers against a fresh `yt-dlp -j` before treating a deviation as a regression, rather than
+  assuming they must still read 144p/MEDIUM.
+- **Fine-motion loop detection (size-budgeted analysis download + escalation ladder).** Small,
+  low-amplitude motion used to be invisible to detection: the old fixed worst-format (~144p)
+  selector plus the 32×18/8-bit fingerprint grid quantized subtle motion away before
+  autocorrelation ever saw it. Two independent, layered fixes:
+  - `select_analysis_format`/`_analysis_selector_string` (§5.1) replace the fixed worst-format
+    selector with a picker that takes the *tallest* format whose estimated whole-file size
+    (`filesize`/`filesize_approx`/`tbr*duration`) fits `--analysis-budget-mb` (default 300 MB),
+    soft-capped by `--analysis-height` (default 480; `0` = tallest under budget). This still
+    obeys the whole-timeline rule — the budget picks **which resolution**, never a time window —
+    and an unknown-size format is always skipped (never selected), so a metadata-sparse source
+    falls back to the exact historical worst-format string.
+  - `detect_period` runs a byte-identical pass-0 coarse detection first (today's exact 32×18/8-bit
+    grid, fixed thresholds) and returns immediately on any positive verdict (HIGH/MEDIUM/LOW) —
+    zero added cost on the common path. Only a STATIC/NONE pass-0 triggers the escalation ladder:
+    the pre-existing sub-second rescue, then a 64×36/`gray16le`/`area`-scaled re-fingerprint of
+    the *same* downloaded file (finer cells + 16-bit precision recover sub-8-bit-LSB motion that
+    8-bit quantization erased), then a signed frame-to-frame motion-energy signal
+    (`temporal_difference_fingerprints`) on that same array (pure numpy, no extra ffmpeg/network),
+    then — network only, last resort — a re-download at `--analysis-max-height` (default 1080)
+    strictly taller than what pass-0 got. Each escalation pass uses relaxed low-contrast
+    thresholds (`_LOW_CONTRAST_PRESET`: `z_strong=2.5`/`c_strong=0.20`/`z_prov=2.2`/`c_prov=0.10`)
+    guarded by `strict_fundamental=True` (refuses to invent a fundamental without harmonic-comb
+    support at ≥60% of its multiples, so non-periodic footage still verdicts NONE) and is capped
+    at MEDIUM (fine-motion recoveries are legitimately lower-confidence than a clean pass-0 HIGH).
+    The thresholds are this low deliberately: at low `--analysis-fps` the escalation signal has
+    very few effective samples (a 72s clip at `--analysis-fps 1` is only 72 rows, and for the
+    signed motion-energy signal roughly half of those rows can be exact-zero when the source's
+    discrete transitions don't land on the sampling grid), which pins genuine periodic peaks'
+    Z-scores in the 2.5–3.0 band even when their contrast is already well past the pass-0 bar —
+    the fixture regression sweep (`static.mp4`/`non_periodic.mp4` stay STATIC/NONE across
+    `--analysis-fps` 1–15) is the evidence this doesn't manufacture false loops. **Win rule
+    (load-bearing):** an escalation result replaces the pass-0 result only if its own verdict is
+    positive; if every escalation pass stays non-positive, the *original* pass-0 result is
+    returned unchanged — escalation can only add detections, never turn a STATIC into NONE or a
+    NONE into a spurious loop. `--no-escalate` disables the entire ladder (including the
+    pre-existing sub-second rescue) for an exact single-coarse-pass comparison.
+  - **`refine_period` must match the escalation's fingerprint precision, or it silently undoes
+    the win rule.** `refine_period` always runs after `detect_period` (even under
+    `--detect-only`) and can downgrade `coarse.verdict` by one notch whenever its own
+    offset-search alignment score `S_best < 0.985`. Its historical fingerprint grid
+    (48×27/8-bit/`fast_bilinear`) has exactly the same sub-8-bit-LSB quantization loss that
+    made pass-0 miss fine motion in the first place, so re-deriving refine fingerprints at that
+    grid for an escalation-sourced coarse result drives `S_best` down (measured ~0.77 on the
+    fine-motion fixture) and downgrades a correctly-recovered LOW/MEDIUM verdict — the *exact*
+    mechanism behind the "escalation ran but the payload came back NONE/inconsistent" failure
+    mode. `_refine_precision(coarse)` fixes this at the root: when
+    `coarse.escalation` is set, `refine_period` fingerprints at the same 64×36/`gray16le`/`area`
+    precision the ladder used to find the period (measured ~0.99999 `S_best` on the same
+    fixture), instead of relaxing the `0.985` gate itself. Ordinary (`escalation=None`) coarse
+    results keep the exact historical 48×27/8-bit/`gray`/`fast_bilinear` refine fingerprint —
+    byte-identical, no regression risk for loops that already detect at pass-0.
+  - **Pass E writes to a distinct filename (`lowres_hi.*`), never reusing pass-0's
+    `lowres.*`.** Reusing the same output template is unreliable: yt-dlp skips re-downloading a
+    complete file of that name (no `--force-overwrites` is set anywhere), so a same-container
+    Pass E re-download silently no-ops, and when the container differs the pass-0 and Pass E
+    files coexist under one `lowres.*` glob where `sorted(...)[0]` can select the stale,
+    alphabetically-first pass-0 file — misreporting `detection.analysis_height` and feeding F3
+    from the wrong file. A distinct prefix sidesteps both failure modes with no new yt-dlp flags.
